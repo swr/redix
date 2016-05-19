@@ -24,7 +24,7 @@ defmodule Redix.PubSub.Connection do
     # A dictionary of `channel => recipient_pids` where `channel` is either
     # `{:channel, "foo"}` or `{:pattern, "foo*"}` and `recipient_pids` is an
     # HashSet of pids of recipients for that channel/pattern.
-    subscribed_channels: HashDict.new,
+    subscriptions: HashDict.new,
 
     # A dictionary of `recipient_pid => monitor_ref` where `monitor_ref` is the
     # ref of the monitor that this GenServer is keeping on `recipient_pid`.
@@ -54,16 +54,8 @@ defmodule Redix.PubSub.Connection do
 
   def connect(info, state) do
     case Utils.connect(state) do
-      {:ok, state} ->
-        state =
-          if info == :backoff do
-            Enum.each(state.clients_to_notify_of_reconnection, &send(&1, msg(:reconnected, nil)))
-            %{state | clients_to_notify_of_reconnection: []}
-          else
-            state
-          end
-
-        {:ok, state}
+      {:ok, _state} = result ->
+        result
       {:error, reason} ->
         Logger.error [
           "Failed to connect to Redis (", Utils.format_host(state), "): ",
@@ -175,24 +167,24 @@ defmodule Redix.PubSub.Connection do
     end
   end
 
-  defp subscribe(%{subscribed_channels: subscribed_channels} = state, op, channels, recipient) do
+  defp subscribe(%{subscriptions: subscriptions} = state, op, channels, recipient) do
     state = maybe_monitor_recipient(state, recipient)
 
     # First, we divide `channels` into the list of channels this GenServer is
     # already subscribed to and the ones it isn't.
     {already_subscribed_channels, new_channels} = Enum.partition(channels, fn(channel) ->
-      HashDict.has_key?(subscribed_channels, {op_to_type(op), channel})
+      HashDict.has_key?(subscriptions, {op_to_type(op), channel})
     end)
 
     # For channels which this GenServer is already subscribed to, we just notify
-    # the recipient that we connected (since we don't have to dependon any
+    # the recipient that we connected (since we don't have to depend on any
     # network operation) and add that recipient under each channel in the
-    # `subscribed_channels` in the state.
-    new_subscribed_channels = Enum.reduce(already_subscribed_channels, subscribed_channels, fn(channel, subscribed_channels) ->
+    # `subscriptions` in the state.
+    new_subscriptions = Enum.reduce(already_subscribed_channels, subscriptions, fn(channel, subscriptions) ->
       send(recipient, msg(op, channel))
-      HashDict.update!(subscribed_channels, {op_to_type(op), channel}, &HashSet.put(&1, recipient))
+      HashDict.update!(subscriptions, {op_to_type(op), channel}, &HashSet.put(&1, recipient))
     end)
-    state = %{state | subscribed_channels: new_subscribed_channels}
+    state = %{state | subscriptions: new_subscriptions}
 
     # Now, we take care of channels which this recipient is the first to
     # subscribe to (meaning that this GenServer is not subscribed to those). If
@@ -216,38 +208,38 @@ defmodule Redix.PubSub.Connection do
     end
   end
 
-  defp unsubscribe(%{subscribed_channels: subscribed_channels} = state, op, channels, recipient) do
+  defp unsubscribe(%{subscriptions: subscriptions} = state, op, channels, recipient) do
     # TODO: move this down, after we unsubscribed
     state = maybe_demonitor_recipient(state, recipient)
 
-    {channels_with_no_more_recipients, new_subscribed_channels} =
-      Enum.flat_map_reduce(channels, subscribed_channels, fn(channel, subscribed_channels) ->
+    {channels_with_no_more_recipients, new_subscriptions} =
+      Enum.flat_map_reduce(channels, subscriptions, fn(channel, subscriptions) ->
         key = {op_to_type(op), channel}
-        if recipients = subscribed_channels[key] do
+        if recipients = subscriptions[key] do
           # We remove the recipient and send the unsubscription confirmation no
           # matter what, as we'll remove this recipient from the list of
           # recipients so we're not going to send messages for `channel` to it
           # anymore.
           new_recipients = HashSet.delete(recipients, recipient)
-          new_subscribed_channels = HashDict.put(subscribed_channels, key, new_recipients)
+          new_subscriptions = HashDict.put(subscriptions, key, new_recipients)
           send(recipient, msg(op, channel))
 
           # If this was the last recipient for `channel`, then let's return
           # `channel` in the list of `channels_with_no_more_recipients`.
           if HashSet.size(new_recipients) == 0 do
-            {[channel], new_subscribed_channels}
+            {[channel], new_subscriptions}
           else
-            {[], new_subscribed_channels}
+            {[], new_subscriptions}
           end
         else
           # If we didn't have any subscribers to `channel`, than this is a no-op.
           # TODO: but we should have at least `recipient` here, so should we
           # error out if we don't? (that would be the case when a recipient
           # unsubscribes multiple times).
-          {[], subscribed_channels}
+          {[], subscriptions}
         end
       end)
-    state = %{state | subscribed_channels: new_subscribed_channels}
+    state = %{state | subscriptions: new_subscriptions}
 
     if channels_with_no_more_recipients == [] do
       {:noreply, state}
@@ -259,13 +251,13 @@ defmodule Redix.PubSub.Connection do
     end
   end
 
-  defp maybe_demonitor_recipient(%{subscribed_channels: subscribed_channels} = state, recipient) do
+  defp maybe_demonitor_recipient(%{subscriptions: subscriptions} = state, recipient) do
     # TODO: we can probably make this much more efficient if we keep something
     # like a counter in `state.monitors` that corresponds to the number of
     # channels each recipient is connected to, and demonitor when it's 0.
 
     # We only demonitor `recipient` if is not subscribed to any channels.
-    subscribed_to_something? = Enum.any?(subscribed_channels, fn({_, recipients}) ->
+    subscribed_to_something? = Enum.any?(subscriptions, fn({_, recipients}) ->
       HashSet.member?(recipients, recipient)
     end)
 
@@ -276,35 +268,35 @@ defmodule Redix.PubSub.Connection do
     state
   end
 
-  defp recipient_terminated(%{subscribed_channels: subscribed_channels} = state, recipient, monitor_ref) do
-    {channels_with_no_more_recipients, new_subscribed_channels} =
-      Enum.flat_map_reduce(HashDict.keys(subscribed_channels), subscribed_channels, fn({op, channel}, subscribed_channels) ->
+  defp recipient_terminated(%{subscriptions: subscriptions} = state, recipient, monitor_ref) do
+    {channels_with_no_more_recipients, new_subscriptions} =
+      Enum.flat_map_reduce(HashDict.keys(subscriptions), subscriptions, fn({op, channel}, subscriptions) ->
         key = {op, channel}
-        if recipients = subscribed_channels[key] do
+        if recipients = subscriptions[key] do
           # We remove the recipient and send the unsubscription confirmation no
           # matter what, as we'll remove this recipient from the list of
           # recipients so we're not going to send messages for `channel` to it
           # anymore.
           new_recipients = HashSet.delete(recipients, recipient)
-          new_subscribed_channels = HashDict.put(subscribed_channels, key, new_recipients)
+          new_subscriptions = HashDict.put(subscriptions, key, new_recipients)
           send(recipient, msg(op, channel))
 
           # If this was the last recipient for `channel`, then let's return
           # `channel` in the list of `channels_with_no_more_recipients`.
           if HashSet.size(new_recipients) == 0 do
-            {[{op, channel}], new_subscribed_channels}
+            {[{op, channel}], new_subscriptions}
           else
-            {[], new_subscribed_channels}
+            {[], new_subscriptions}
           end
         else
           # If we didn't have any subscribers to `channel`, than this is a no-op.
           # TODO: but we should have at least `recipient` here, so should we
           # error out if we don't? (that would be the case when a recipient
           # unsubscribes multiple times).
-          {[], subscribed_channels}
+          {[], subscriptions}
         end
       end)
-    state = %{state | subscribed_channels: new_subscribed_channels}
+    state = %{state | subscriptions: new_subscriptions}
 
     {channels, patterns} = Enum.partition(channels_with_no_more_recipients, &match?({:channel, _}, &1))
     channels = Enum.map(channels, fn({:channel, channel}) -> channel end)
@@ -346,9 +338,9 @@ defmodule Redix.PubSub.Connection do
 
     state = %{state | queue: new_queue}
 
-    new_subscribed_channels =
-      HashDict.update(state.subscribed_channels, {op_to_type(op), channel}, HashSet.put(HashSet.new, recipient), &HashSet.put(&1, recipient))
-    %{state | subscribed_channels: new_subscribed_channels}
+    new_subscriptions =
+      HashDict.update(state.subscriptions, {op_to_type(op), channel}, HashSet.put(HashSet.new, recipient), &HashSet.put(&1, recipient))
+    %{state | subscriptions: new_subscriptions}
   end
 
   defp handle_pubsub_msg(state, [op, channel, _count]) when op in ~w(unsubscribe punsubscribe) do
@@ -366,14 +358,14 @@ defmodule Redix.PubSub.Connection do
       state
     else
       send(recipient, msg(op, channel))
-      new_subscribed_channels = HashDict.update!(state.subscribed_channels, {op_to_type(op), channel}, &HashSet.delete(&1, recipient))
-      %{state | subscribed_channels: new_subscribed_channels}
+      new_subscriptions = HashDict.update!(state.subscriptions, {op_to_type(op), channel}, &HashSet.delete(&1, recipient))
+      %{state | subscriptions: new_subscriptions}
     end
   end
 
   # A message arrived from a channel.
   defp handle_pubsub_msg(state, ["message", channel, payload]) do
-    recipients = HashDict.fetch!(state.subscribed_channels, {:channel, channel})
+    recipients = HashDict.fetch!(state.subscriptions, {:channel, channel})
     Enum.each(recipients, &send(&1, msg(:message, payload, channel)))
 
     state
@@ -381,7 +373,7 @@ defmodule Redix.PubSub.Connection do
 
   # A message arrived from a pattern.
   defp handle_pubsub_msg(state, ["pmessage", pattern, channel, payload]) do
-    recipients = HashDict.fetch!(state.subscribed_channels, {:pattern, pattern})
+    recipients = HashDict.fetch!(state.subscriptions, {:pattern, pattern})
     Enum.each(recipients, &send(&1, msg(:pmessage, payload, {pattern, channel})))
 
     state
@@ -399,7 +391,7 @@ defmodule Redix.PubSub.Connection do
   defp op_to_type(op) when op in [:psubscribe, :punsubscribe], do: :pattern
 
   defp client_subscriptions(state, client) do
-    state.subscribed_channels
+    state.subscriptions
     |> Enum.filter(fn({_, recipients}) -> HashSet.member?(recipients, client) end)
     |> Enum.map(fn({channel, _recipients}) -> channel end)
   end
