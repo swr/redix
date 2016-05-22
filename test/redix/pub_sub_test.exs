@@ -119,15 +119,20 @@ defmodule Redix.PubSubTest do
     :timer.sleep(100)
   end
 
-  test "clients are notified of disconnections", %{conn: ps} do
+  test "disconnections/reconnections", %{conn: ps} do
     assert :ok = PubSub.subscribe(ps, "foo", self())
     assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}
 
+    {:ok, c} = Redix.start_link
+
     silence_log fn ->
-      {:ok, c} = Redix.start_link
       Redix.command!(c, ~w(CLIENT KILL TYPE pubsub))
       assert_receive {:redix_pubsub, ^ps, :disconnected, %{reason: _reason}}
+      assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}, 1000
     end
+
+    Redix.command!(c, ~w(PUBLISH foo hello))
+    assert_receive {:redix_pubsub, ^ps, :message, %{channel: "foo", payload: "hello"}}
   end
 
   # This function just sends back to this process every message it receives.

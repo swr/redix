@@ -42,9 +42,48 @@ defmodule Redix.PubSub.Connection do
     end
   end
 
-  def connect(_info, state) do
+  def connect(info, state) do
     case Utils.connect(state) do
-      {:ok, _state} = result ->
+      {:ok, state} = result ->
+        if info == :backoff do
+          Enum.each(state.subscriptions, fn({{kind, target}, subscribers}) ->
+            msg_kind =
+              case kind do
+                :channel -> :subscribed
+                :pattern -> :psubscribed
+              end
+            subscribers
+            |> HashDict.keys()
+            |> Enum.each(fn(pid) -> send(pid, {:redix_pubsub, self(), msg_kind, %{to: target}}) end)
+
+            {channels, patterns} = Enum.partition(state.subscriptions, &match?({{:channel, _}, _}, &1))
+
+            channels = Enum.map(channels, fn({{:channel, channel}, _}) -> channel end)
+            patterns = Enum.map(patterns, fn({{:pattern, pattern}, _}) -> pattern end)
+
+            redis_command = []
+            redis_command =
+              if channels != [] do
+                redis_command ++ [["SUBSCRIBE" | channels]]
+              else
+                redis_command
+              end
+
+            redis_command =
+              if patterns != [] do
+                redis_command ++ [["PSUBSCRIBE" | patterns]]
+              else
+                redis_command
+              end
+
+            case :gen_tcp.send(state.socket, Enum.map(redis_command, &Protocol.pack/1)) do
+              :ok ->
+                result
+              {:error, _reason} = error ->
+                {:disconnect, error, state}
+            end
+          end)
+        end
         result
       {:error, reason} ->
         Logger.error [
