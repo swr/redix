@@ -6,175 +6,112 @@ defmodule Redix.PubSubTest do
 
   setup do
     {:ok, ps} = PubSub.start_link
+    on_exit(fn -> PubSub.stop(ps) end)
     {:ok, %{conn: ps}}
   end
 
-  test "subscribe/3: one channel", %{conn: ps} do
-    assert :ok = PubSub.subscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-  end
+  test "subscribe/unsubscribe flow", %{conn: ps} do
+    {:ok, c} = Redix.start_link()
 
-  test "subscribe/3: multiple channels", %{conn: ps} do
+    # First, we subscribe.
     assert :ok = PubSub.subscribe(ps, ["foo", "bar"], self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-    assert_receive {:redix_pubsub, :subscribe, "bar", _}
-  end
+    assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}
+    assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "bar"}}
 
-  test "psubscribe/3: one pattern", %{conn: ps} do
-    assert :ok = PubSub.psubscribe(ps, "foo*", self())
-    assert_receive {:redix_pubsub, :psubscribe, "foo*", _}
-  end
-
-  test "psubscribe/3: multiple patterns", %{conn: ps} do
-    assert :ok = PubSub.psubscribe(ps, ["foo*", "bar*"], self())
-    assert_receive {:redix_pubsub, :psubscribe, "foo*", _}
-    assert_receive {:redix_pubsub, :psubscribe, "bar*", _}
-  end
-
-  test "unsubscribe/3: single channel", %{conn: ps} do
-    assert :ok = PubSub.subscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-    assert :ok = PubSub.unsubscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :unsubscribe, "foo", _}
-  end
-
-  test "unsubscribe/3: multiple channels", %{conn: ps} do
-    assert :ok = PubSub.subscribe(ps, ~w(foo bar), self())
-    assert_receive {:redix_pubsub, :subscribe, _, _}
-    assert_receive {:redix_pubsub, :subscribe, _, _}
-    assert :ok = PubSub.unsubscribe(ps, ~w(foo bar), self())
-    assert_receive {:redix_pubsub, :unsubscribe, "foo", _}
-    assert_receive {:redix_pubsub, :unsubscribe, "bar", _}
-  end
-
-  test "punsubscribe/3: single channel", %{conn: ps} do
-    assert :ok = PubSub.psubscribe(ps, "foo*", self())
-    assert_receive {:redix_pubsub, :psubscribe, "foo*", _}
-    assert :ok = PubSub.punsubscribe(ps, "foo*", self())
-    assert_receive {:redix_pubsub, :punsubscribe, "foo*", _}
-  end
-
-  test "punsubscribe/3: multiple channels", %{conn: ps} do
-    assert :ok = PubSub.psubscribe(ps, ~w(foo* bar?), self())
-    assert_receive {:redix_pubsub, :psubscribe, _, _}
-    assert_receive {:redix_pubsub, :psubscribe, _, _}
-    assert :ok = PubSub.punsubscribe(ps, ~w(foo* bar?), self())
-    assert_receive {:redix_pubsub, :punsubscribe, "foo*", _}
-    assert_receive {:redix_pubsub, :punsubscribe, "bar?", _}
-  end
-
-  test "subscribing the same pid to the same channel more than once has no effect", %{conn: ps} do
-    assert :ok = PubSub.subscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-    assert :ok = PubSub.subscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-
-    {:ok, c} = Redix.start_link
-
+    # Then, we test messages are routed correctly.
     Redix.command!(c, ~w(PUBLISH foo hello))
+    assert_receive {:redix_pubsub, ^ps, :message, %{channel: "foo", payload: "hello"}}
+    Redix.command!(c, ~w(PUBLISH bar world))
+    assert_receive {:redix_pubsub, ^ps, :message, %{channel: "bar", payload: "world"}}
 
-    assert_receive {:redix_pubsub, :message, "hello", "foo"}
-    refute_receive {:redix_pubsub, :message, "hello", "foo"}
+    # Then, we unsubscribe.
+    assert :ok = PubSub.unsubscribe(ps, ["foo"], self())
+    assert_receive {:redix_pubsub, ^ps, :unsubscribed, %{from: "foo"}}
+
+    # And finally, we test that we don't receive messages anymore for
+    # unsubscribed channels, but we do for subscribed channels.
+    Redix.command!(c, ~w(PUBLISH foo hello))
+    refute_receive {:redix_pubsub, ^ps, :message, %{channel: "foo", payload: "hello"}}
+    Redix.command!(c, ~w(PUBLISH bar world))
+    assert_receive {:redix_pubsub, ^ps, :message, %{channel: "bar", payload: "world"}}
   end
 
-  test "pubsub: subscribing to channels and receiving messages", %{conn: ps} do
+  test "psubscribe/punsubscribe flow", %{conn: ps} do
     {:ok, c} = Redix.start_link
 
-    PubSub.subscribe(ps, ~w(foo bar), self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-    assert_receive {:redix_pubsub, :subscribe, "bar", _}
+    PubSub.psubscribe(ps, ["foo*", "ba?"], self())
+    assert_receive {:redix_pubsub, ^ps, :psubscribed, %{to: "foo*"}}
+    assert_receive {:redix_pubsub, ^ps, :psubscribed, %{to: "ba?"}}
 
-    Redix.pipeline!(c, [~w(PUBLISH foo foo), ~w(PUBLISH bar bar), ~w(PUBLISH baz baz)])
-    assert_receive {:redix_pubsub, :message, "foo", "foo"}
-    assert_receive {:redix_pubsub, :message, "bar", "bar"}
-    refute_receive {:redix_pubsub, :message, "baz", "baz"}
+    Redix.pipeline!(c, [
+      ~w(PUBLISH foo_1 foo_1),
+      ~w(PUBLISH foo_2 foo_2),
+      ~w(PUBLISH bar bar),
+      ~w(PUBLISH barfoo barfoo),
+    ])
 
-    PubSub.unsubscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :unsubscribe, "foo", _}
-
-    Redix.pipeline!(c, [~w(PUBLISH foo foo), ~w(PUBLISH bar bar)])
-    refute_receive {:redix_pubsub, :message, "foo", "foo"}
-    assert_receive {:redix_pubsub, :message, "bar", "bar"}
-  end
-
-  test "pubsub: subscribing to patterns and receiving messages", %{conn: ps} do
-    {:ok, c} = Redix.start_link
-
-    PubSub.psubscribe(ps, ~w(foo* ba?), self())
-    assert_receive {:redix_pubsub, :psubscribe, "foo*", _}
-    assert_receive {:redix_pubsub, :psubscribe, "ba?", _}
-
-    Redix.pipeline!(c, [~w(PUBLISH foo_1 foo_1),
-                        ~w(PUBLISH foo_2 foo_2),
-                        ~w(PUBLISH bar bar),
-                        ~w(PUBLISH barfoo barfoo)])
-
-    assert_receive {:redix_pubsub, :pmessage, "foo_1", {"foo*", "foo_1"}}
-    assert_receive {:redix_pubsub, :pmessage, "foo_2", {"foo*", "foo_2"}}
-    assert_receive {:redix_pubsub, :pmessage, "bar", {"ba?", "bar"}}
-    refute_receive {:redix_pubsub, :pmessage, "barfoo", {_, "barfoo"}}
+    assert_receive {:redix_pubsub, ^ps, :pmessage, %{payload: "foo_1", channel: "foo_1", pattern: "foo*"}}
+    assert_receive {:redix_pubsub, ^ps, :pmessage, %{payload: "foo_2", channel: "foo_2", pattern: "foo*"}}
+    assert_receive {:redix_pubsub, ^ps, :pmessage, %{payload: "bar", channel: "bar", pattern: "ba?"}}
+    refute_receive {:redix_pubsub, ^ps, :pmessage, %{payload: "barfoo"}}
 
     PubSub.punsubscribe(ps, "foo*", self())
-    assert_receive {:redix_pubsub, :punsubscribe, "foo*", _}
+    assert_receive {:redix_pubsub, ^ps, :punsubscribed, %{from: "foo*"}}
 
     Redix.pipeline!(c, [~w(PUBLISH foo_x foo_x), ~w(PUBLISH baz baz)])
 
-    refute_receive {:redix_pubsub, :pmessage, "foo_x", {"foo*", "foo_x"}}
-    assert_receive {:redix_pubsub, :pmessage, "baz", {"ba?", "baz"}}
+    refute_receive {:redix_pubsub, ^ps, :pmessage, %{payload: "foo_x"}}
+    assert_receive {:redix_pubsub, ^ps, :pmessage, %{payload: "baz", channel: "baz", pattern: "ba?"}}
   end
 
-  test "pubsub: subscribing multiple times to the same channel has no effects", %{conn: ps} do
+  test "subscribing the same pid to the same channel more than once has no effect", %{conn: ps} do
     {:ok, c} = Redix.start_link
 
-    PubSub.subscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
+    assert :ok = PubSub.subscribe(ps, "foo", self())
+    assert :ok = PubSub.subscribe(ps, "foo", self())
+    assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}
+    assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}
 
-    PubSub.subscribe(ps, ["foo", "bar"], self())
-    # We still receive two messages so that we don't have to keep track of
-    # already subscribed channels.
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-    assert_receive {:redix_pubsub, :subscribe, "bar", _}
-
-    # Let's be sure we only receive *one* message on the "foo" channel.
     Redix.command!(c, ~w(PUBLISH foo hello))
-    assert_receive {:redix_pubsub, :message, "hello", _}
-    refute_receive {:redix_pubsub, :message, "hello", _}
+
+    assert_receive {:redix_pubsub, ^ps, :message, %{channel: "foo", payload: "hello"}}
+    refute_receive {:redix_pubsub, ^ps, :message, %{channel: "foo", payload: "hello"}}
   end
 
   test "pubsub: unsubscribing a recipient doesn't affect other recipients", %{conn: ps} do
     {:ok, c} = Redix.start_link
 
-    parent = self
+    parent = self()
     mirror = spawn_link(fn -> message_mirror(parent) end)
 
     # Let's subscribe two different pids to the same channel.
-    PubSub.subscribe(ps, "foo", self)
-    assert_receive {:redix_pubsub, :subscribe, _, _}
-    PubSub.subscribe(ps, "foo", mirror)
-    assert_receive {^mirror, {:redix_pubsub, :subscribe, _, _}}
+    assert :ok = PubSub.subscribe(ps, ["foo"], self())
+    assert_receive {:redix_pubsub, ^ps, :subscribed, _meta}
+    assert :ok = PubSub.subscribe(ps, ["foo"], mirror)
+    assert_receive {^mirror, {:redix_pubsub, ^ps, :subscribed, _meta}}
 
     # Let's ensure both those pids receive messages published on that channel.
     Redix.command!(c, ~w(PUBLISH foo hello))
-    assert_receive {:redix_pubsub, :message, _, _}
-    assert_receive {^mirror, {:redix_pubsub, :message, _, _}}
+    assert_receive {:redix_pubsub, ^ps, :message, %{payload: "hello"}}
+    assert_receive {^mirror, {:redix_pubsub, ^ps, :message, %{payload: "hello"}}}
 
     # Now let's unsubscribe just one pid from that channel.
-    PubSub.unsubscribe(ps, "foo", self)
-    assert_receive {:redix_pubsub, :unsubscribe, _, _}
-    refute_receive {^mirror, {:redix_pubsub, :unsubscribe, _, _}}
+    PubSub.unsubscribe(ps, "foo", self())
+    assert_receive {:redix_pubsub, ^ps, :unsubscribed, %{from: "foo"}}
+    refute_receive {^mirror, {:redix_pubsub, ^ps, :unsubscribed, %{from: "foo"}}}
 
     # Publishing now should send a message to the non-unsubscribed pid.
     Redix.command!(c, ~w(PUBLISH foo hello))
-    refute_receive {:redix_pubsub, :message, _, _}
-    assert_receive {^mirror, _}
+    refute_receive {:redix_pubsub, ^ps, :message, %{payload: "hello"}}
+    assert_receive {^mirror, {:redix_pubsub, ^ps, :message, %{payload: "hello"}}}
   end
 
   test "recipients are monitored and the connection unsubcribes when they go down", %{conn: ps} do
-    parent = self
+    parent = self()
     pid = spawn(fn -> message_mirror(parent) end)
 
     assert :ok = PubSub.subscribe(ps, "foo", pid)
-    assert_receive {^pid, {:redix_pubsub, :subscribe, "foo", _}}
+    assert_receive {^pid, {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}}
 
     # Let's just ensure no errors happen when we kill the recipient.
     Process.exit(pid, :kill)
@@ -182,17 +119,14 @@ defmodule Redix.PubSubTest do
     :timer.sleep(100)
   end
 
-  @tag :skip
   test "clients are notified of disconnections", %{conn: ps} do
-    PubSub.subscribe(ps, "foo", self())
-    assert_receive {:redix_pubsub, :subscribe, "foo", _}
-
-    {:ok, c} = Redix.start_link
+    assert :ok = PubSub.subscribe(ps, "foo", self())
+    assert_receive {:redix_pubsub, ^ps, :subscribed, %{to: "foo"}}
 
     silence_log fn ->
+      {:ok, c} = Redix.start_link
       Redix.command!(c, ~w(CLIENT KILL TYPE pubsub))
-      assert_receive {:redix_pubsub, :disconnected, _reason, [{:channel, "foo"}]}
-      assert_receive {:redix_pubsub, :reconnected, _, _}, 1000
+      assert_receive {:redix_pubsub, ^ps, :disconnected, %{reason: _reason}}
     end
   end
 

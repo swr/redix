@@ -1,3 +1,4 @@
+ExUnit.configure(assert_receive_timeout: 500, refute_receive_timeout: 500)
 ExUnit.start()
 
 case :gen_tcp.connect('localhost', 6379, []) do
